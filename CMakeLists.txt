@@ -10,6 +10,8 @@ add_executable(kvdb
     WALWriter.cpp
     WALReplayer.cpp
     ClientHandler.cpp
+    ReplicationServer.cpp
+    ReplicationClient.cpp
 )
 
 add_executable(kvdb-cli
