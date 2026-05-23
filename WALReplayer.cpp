@@ -5,12 +5,14 @@
 #include <sys/stat.h>
 #include <iostream>
 #include <vector>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <io.h>
 #define open _open
 #define read _read
 #define close _close
+#define lseek _lseek
 #ifndef O_BINARY
 #define O_BINARY _O_BINARY
 #endif
@@ -38,6 +40,7 @@ size_t WALReplayer::replay(KVStore* store) {
     size_t count = 0;
     uint64_t max_lsn = 0;
     uint64_t max_term = 0;
+    uint64_t last_valid_offset = 0;
 
     auto read_exact = [&](int fd, uint8_t* buf, size_t len) -> bool {
         size_t total = 0;
@@ -88,7 +91,6 @@ size_t WALReplayer::replay(KVStore* store) {
         uint32_t calculated_crc = Crc32::calculate(payload.data(), payload.size());
         if (calculated_crc != expected_crc) {
             std::cerr << "WAL Replay: CRC mismatch at record " << (count + 1) << ". Stopping replay.\n";
-            // In a real system, we might truncate the file here to remove corrupt tail.
             break;
         }
 
@@ -100,9 +102,25 @@ size_t WALReplayer::replay(KVStore* store) {
         if (lsn > max_lsn) max_lsn = lsn;
         if (term > max_term) max_term = term;
         count++;
+
+        last_valid_offset = lseek(fd, 0, SEEK_CUR);
     }
 
     close(fd);
+
+    try {
+        if (std::filesystem::exists(filepath_)) {
+            uint64_t file_size = std::filesystem::file_size(filepath_);
+            if (file_size > last_valid_offset) {
+                std::cerr << "WAL Replay: Truncating corrupt/truncated tail of " << (file_size - last_valid_offset)
+                          << " bytes from WAL file: " << filepath_ << "\n";
+                std::filesystem::resize_file(filepath_, last_valid_offset);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "WAL Replay: Failed to truncate WAL file: " << e.what() << "\n";
+    }
+
     store->set_lsn_and_term(max_lsn, max_term);
     return count;
 }
