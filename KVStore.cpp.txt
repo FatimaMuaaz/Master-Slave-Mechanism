@@ -1,0 +1,175 @@
+#include "KVStore.h"
+#include <iostream>
+
+KVStore::KVStore() : current_lsn_(0), current_term_(0) {
+}
+
+KVStore::~KVStore() {
+}
+
+void KVStore::init(const std::string& data_dir) {
+    data_dir_ = data_dir;
+    wal_ = std::make_unique<WALWriter>(data_dir);
+}
+
+void KVStore::set_lsn_and_term(uint64_t lsn, uint64_t term) {
+    std::lock_guard<std::mutex> lock(mu_);
+    current_lsn_ = lsn;
+    current_term_ = term;
+}
+
+void KVStore::apply_raw(uint8_t op_type, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (op_type == 1) { // PUT
+        map_[key] = value;
+    } else if (op_type == 2) { // DELETE
+        map_.erase(key);
+    }
+}
+
+bool KVStore::apply_replicated_record(uint64_t lsn, uint64_t term, uint8_t op_type, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(mu_);
+    
+    // Check continuity
+    if (lsn != current_lsn_ + 1) {
+        std::cerr << "[store] LSN gap detected: expected " << (current_lsn_ + 1) << ", got " << lsn << "\n";
+        return false;
+    }
+
+    if (wal_->append(lsn, term, op_type, key, value)) {
+        if (op_type == 1) {
+            map_[key] = value;
+        } else if (op_type == 2) {
+            map_.erase(key);
+        }
+        current_lsn_ = lsn;
+        current_term_ = term;
+        cv_.notify_all();
+        return true;
+    }
+    return false;
+}
+
+bool KVStore::put(const std::string& key, const std::string& value, uint64_t& out_lsn) {
+    std::lock_guard<std::mutex> lock(mu_);
+    current_lsn_++;
+    out_lsn = current_lsn_;
+    
+    if (wal_->append(current_lsn_, current_term_, 1, key, value)) {
+        map_[key] = value;
+        cv_.notify_all();
+        return true;
+    }
+    return false;
+}
+
+bool KVStore::del(const std::string& key, uint64_t& out_lsn) {
+    std::lock_guard<std::mutex> lock(mu_);
+    current_lsn_++;
+    out_lsn = current_lsn_;
+    
+    if (wal_->append(current_lsn_, current_term_, 2, key, "")) {
+        map_.erase(key);
+        cv_.notify_all();
+        return true;
+    }
+    return false;
+}
+
+bool KVStore::get(const std::string& key, std::string& out_val) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = map_.find(key);
+    if (it != map_.end()) {
+        out_val = it->second;
+        return true;
+    }
+    return false;
+}
+
+uint64_t KVStore::get_lsn() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return current_lsn_;
+}
+
+uint64_t KVStore::get_term() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return current_term_;
+}
+
+std::string KVStore::get_data_dir() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return data_dir_;
+}
+
+void KVStore::wait_for_lsn(uint64_t last_seen_lsn) {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this, last_seen_lsn] { return current_lsn_ > last_seen_lsn; });
+}
+
+void KVStore::set_node_id(int node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    node_id_ = node_id;
+}
+
+int KVStore::get_node_id() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return node_id_;
+}
+
+void KVStore::set_role(const std::string& role) {
+    std::lock_guard<std::mutex> lock(mu_);
+    role_ = role;
+}
+
+std::string KVStore::get_role() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return role_;
+}
+
+void KVStore::set_master_addr(const std::string& host, int port) {
+    std::lock_guard<std::mutex> lock(mu_);
+    master_host_ = host;
+    master_port_ = port;
+}
+
+std::string KVStore::get_master_host() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return master_host_;
+}
+
+int KVStore::get_master_port() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return master_port_;
+}
+
+void KVStore::set_client_port(int port) {
+    std::lock_guard<std::mutex> lock(mu_);
+    client_port_ = port;
+}
+
+int KVStore::get_client_port() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return client_port_;
+}
+
+void KVStore::register_peer(int node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    peer_table_[node_id] = 0;
+}
+
+void KVStore::remove_peer(int node_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    peer_table_.erase(node_id);
+}
+
+void KVStore::update_peer_ack(int node_id, uint64_t lsn) {
+    std::lock_guard<std::mutex> lock(mu_);
+    peer_table_[node_id] = lsn;
+    cv_.notify_all();
+}
+
+std::unordered_map<int, uint64_t> KVStore::get_peer_acks() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return peer_table_;
+}
+
